@@ -1,0 +1,21 @@
+name: main
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+env:
+  SC_VERSION: "0.7.2"
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: |
+        wget "https://github.com/koalaman/shellcheck/releases/download/v${SC_VERSION}/shellcheck-v${SC_VERSION}.linux.x86_64.tar.xz"
+        tar xvf "shellcheck-v${SC_VERSION}.zip"
+        install -m 0755 "shellcheck-v${SC_VERSION}/shellcheck" /usr/local/bin/
+        shellcheck --version
+      - run: shellcheck iptables-docker-filter
