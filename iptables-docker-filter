@@ -1,0 +1,175 @@
+#!/bin/sh
+#
+# Filter iptables -S or iptables-save output removing rules that seem to have
+# been inserted Docker.
+#
+# Copyright (c) 2021 Gianluca Merlo
+#
+# Use of this source code is governed by an MIT-style license that can be found
+# in the LICENSE file or at https://opensource.org/licenses/MIT.
+
+set -e
+
+PROGRAMNAME="$(basename "$0")"
+
+usage() {
+    cat >&2 <<EOF
+Usage: ${PROGRAMNAME} [OPTIONS]
+
+OPTIONS:
+    -h:         Print help
+    -q:         Quiet mode: suppress writing informational messages on STDERR
+    -c:         Only comment filtered lines, do not remove them
+    -i <FILE>:  Read rules from file instead of STDIN
+    -o <FILE>:  Output rules to file instead of STDOUT
+    -b:         Backup output file if existing (needs -o)
+
+EXAMPLES:
+    iptables-save | ${PROGRAMNAME} > /etc/iptables/rules.v4
+    iptables-save | ${PROGRAMNAME} -o /etc/iptables/rules.v4 -b -c
+    ${PROGRAMNAME} -i /etc/iptables/rules.v4 -o /etc/iptables/rules.v4.without-docker
+EOF
+}
+
+QUIET=0
+COMMENT=0
+INFILE=/dev/stdin
+OUTFILE=
+BACKUP=0
+while getopts 'hqci:o:b' OPT; do
+    case "${OPT}" in
+        h)
+            usage
+            exit 0
+            ;;
+        q)
+            QUIET=1
+            ;; 
+        c)
+            COMMENT=1
+            ;;
+        i)
+            INFILE="${OPTARG}"
+            ;;
+        o)
+            OUTFILE="${OPTARG}"
+            ;;
+        b)  
+            BACKUP=1
+            ;;
+        *)
+            echo "Unknown option: -${OPT}" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+# Check for things we need
+command -v docker >/dev/null
+command -v iptables-save >/dev/null
+command -v readlink  >/dev/null
+test "$(pwd)" = "$(readlink -f .)"
+
+# A function to output text, accounting for quiet mode
+say() {
+    [ ${QUIET} -gt 0 ] && return 0
+    echo "$@" >&2
+}
+
+# Comment mode needs perl, while standard mode needs grep with PCRE support.
+if [ ${COMMENT} -gt 0 ]; then
+    command -v perl >/dev/null
+else
+    echo 'test' | grep -q -P '^test$'
+fi
+
+# Backup needs output file
+if [ ${BACKUP} -gt 0 ] && [ -z "${OUTFILE}" ]; then
+    echo "-b required -o <FILE>";
+    usage
+    exit 1
+fi
+
+# Test if we can read from input
+if [ ! -r "${INFILE}" ]; then
+    echo "Cannot read from ${INFILE}" >&2
+    exit 1
+fi
+
+# Variable for grep patterns (PCRE). Start with patterns for any chain action on
+# chain names that begin with DOCKER, but are not DOCKER-USER. Append and jump
+# should be a safe minimum. iptables-save uses short options.
+PATTERNS='^('
+PATTERNS="${PATTERNS}(:|(-[AN]|.*?-j)\s+)DOCKER(?!-USER)"
+# Other patterns come from acting on bridge network devices. Docker hides some
+# of the needed information (explicit device names, container addresses) from a
+# general network list, and requires us to inspect each bridge individually.
+# Since a pipe/while/read loop implies a subshell, we cannot alter PATTERNS.
+# Using fifos and temporary files seems a waste for so little. Place the whole
+# routine in a function, and use its output.
+get_bridge_patterns() {
+    docker network ls --filter=driver=bridge --filter=scope=local -q | while IFS= read -r NETID; do
+        test -n "${NETID}" || continue
+        # Bridges can have explicit names
+        BRIDGE_NAME="$(docker network inspect "${NETID}" --format '{{ index .Options "com.docker.network.bridge.name" }}')"
+        # If they do not, assume they are in the default format
+        [ -n "${BRIDGE_NAME}" ] || BRIDGE_NAME="br-${NETID}"
+        # Test we have a real bridge
+        ip link show "${BRIDGE_NAME}" >/dev/null
+        say "Found docker bridge: ${BRIDGE_NAME}"
+        # Add a pattern for interface options.
+        printf '|(.*?-[io]\s+%s)' "${BRIDGE_NAME}"
+        # This bridge can have containers on it. Docker creates MASQUERADE rules
+        # in POSTROUTING for their addresses. Match them.
+        ADDR_PATTERN="$(\
+            docker network inspect "${NETID}" --format '{{ range .Containers }}{{ printf "%s\n" .IPv4Address }}{{ end }}' \
+            | sed -e '/^$/d ; s/\/[0-9]\+// ; s/\./\\./g' \
+            | tr '\n' '|' \
+            | sed -e 's/|$//' \
+        )"
+        [ -n "${ADDR_PATTERN}" ] && printf '|(-A\s+POSTROUTING\s+-s\s+(%s).*?-j\s+MASQUERADE)' "${ADDR_PATTERN}"
+    done
+}
+# Add bridge patterns from function output and close the initial group
+PATTERNS="${PATTERNS}$(get_bridge_patterns))"
+say "Exclude pattern is: ${PATTERNS}"
+
+# Redirect to file if necessary. Ensure we can write it before starting.
+if [ -n "${OUTFILE}" ]; then
+    # Make path to output file absolute
+    OUTFILE=$(readlink -f "${OUTFILE}")
+    if [ -e "${OUTFILE}" ]; then
+        # Outfile exists, it must be a file
+        test -f "${OUTFILE}" 
+        # Make a backup if necessary
+        if [ ${BACKUP} -gt 0 ]; then
+            BACKUPFILE="$(mktemp "${OUTFILE}.$(date -Iseconds).XXXXXXXXXX")"
+            cp "${OUTFILE}" "${BACKUPFILE}"
+            say "Backup created: ${BACKUPFILE}" 
+        fi
+    fi
+    # Create/test writability with touch
+    touch "${OUTFILE}"
+    # Redirect
+    say "Writing to: ${OUTFILE}" 
+    exec 4<&1
+    exec 1> "${OUTFILE}"
+fi
+
+# Now run iptables-save, and pass it through our filter.
+if [ ${COMMENT} -gt 0 ]; then
+    # In comment mode, use perl. It seems less wasteful than spawning a grep for
+    # each line
+    perl -pe "s/${PATTERNS}/#\1/" < "${INFILE}"
+else
+    # In standard mode, use grep
+    grep -v -P -- "${PATTERNS}" < "${INFILE}" || true
+fi
+
+# Restore output redirection and close FD
+if [ -n "${OUTFILE}" ]; then
+    exec 1<&4
+    exec 4<&-
+fi
